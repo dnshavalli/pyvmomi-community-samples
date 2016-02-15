@@ -35,19 +35,45 @@ def print_vm_info(vm, depth=1, max_depth=10):
         for c in vmList:
             print_vm_info(c, depth + 1)
         return
-
+    returnDict = {'name':'','path':'','guest':'','annotation':'','state':'','ip':'','question':'','numVirtualDisks':'','numEthernetCards':'','template':'','memorySizeMB':''}
     summary = vm.summary
-    print "Name       : ", summary.config.name
-    print "Path       : ", summary.config.vmPathName
-    print "Guest      : ", summary.config.guestFullName
+    #print "Name       : ", summary.config.name
+    #print "Path       : ", summary.config.vmPathName
+    #print "Guest      : ", summary.config.guestFullName
+    returnDict['name'] = summary.config.name
+    returnDict['path'] = summary.config.vmPathName
+    returnDict['guest'] = summary.config.guestFullName
+
+    try:
+        returnDict['numVirtualDisks'] = summary.config.numVirtualDisks
+    except:
+        pass
+    try:
+        returnDict['numEthernetCards'] = summary.config.numEthernetCards
+    except:
+        pass
+    try:
+        returnDict['template'] = summary.config.template
+    except:
+        pass
+    try:
+        returnDict['memorySizeMB'] = summary.config.memorySizeMB
+    except:
+        pass
+
     annotation = summary.config.annotation
     if annotation:
-        print "Annotation : ", annotation
-    print "State      : ", summary.runtime.powerState
+        #print "Annotation : ", annotation
+        returnDict['annotation'] = annotation
+    #print "State      : ", summary.runtime.powerState
+    returnDict['state'] = summary.runtime.powerState
     if summary.guest is not None:
         ip = summary.guest.ipAddress
         if ip:
-            print "IP         : ", ip
+            #print "IP         : ", ip
+            returnDict['ip'] = ip
     if summary.runtime.question is not None:
-        print "Question  : ", summary.runtime.question.text
-    print ""
+        #print "Question  : ", summary.runtime.question.text
+        returnDict['question'] = summary.runtime.question.text
+    #print ""
+    return(returnDict)
