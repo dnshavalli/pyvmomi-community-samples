@@ -8,6 +8,9 @@
 
  Script to deploy VM via a single .ovf and a single .vmdk file.
 """
+import ssl
+import time
+import requests
 from os import system, path
 from sys import exit
 from threading import Thread
@@ -50,25 +53,28 @@ def get_args():
                         required=False,
                         action='store',
                         default=None,
-                        help='Name of the Datacenter you\
-                          wish to use. If omitted, the first\
-                          datacenter will be used.')
+                        help=("Name of the Datacenter you "
+                              "wish to use. If omitted, the first "
+                              "datacenter will be used.")
+                        )
 
     parser.add_argument('--datastore_name',
                         required=False,
                         action='store',
                         default=None,
-                        help='Datastore you wish the VM to be deployed to. \
-                          If left blank, VM will be put on the first \
-                          datastore found.')
+                        help=("Datastore you wish the VM to be deployed to. "
+                              "If left blank, VM will be put on the first "
+                              "datastore found.")
+                        )
 
     parser.add_argument('--cluster_name',
                         required=False,
                         action='store',
                         default=None,
-                        help='Name of the cluster you wish the VM to\
-                          end up on. If left blank the first cluster found\
-                          will be used')
+                        help=("Name of the cluster you wish the VM to "
+                              "end up on. If left blank the first cluster found "
+                              "will be used")
+                        )
 
     parser.add_argument('-v', '--vmdk_path',
                         required=True,
@@ -81,6 +87,15 @@ def get_args():
                         action='store',
                         default=None,
                         help='Path of the OVF file to deploy.')
+
+    parser.add_argument('--disable_ssl_verification',
+                        required=False,
+                        action='store_true',
+                        default=False,
+                        help=("WARNING! INSECURE: Ignore certificate errors "
+                              "from vSphere. Boolean flag. Default=False")
+                        )
+
 
     args = parser.parse_args()
 
@@ -171,16 +186,95 @@ def keep_lease_alive(lease):
             return
 
 
+def upload_file(service_instance):
+    '''
+    This function sourced and modified from:
+    ../pyvmomi-community-samples/samples/upload_file_to_datastore.py
+    '''
+    content = service_instance.RetrieveContent()
+    session_manager = content.sessionManager
+
+    # Get the list of all datacenters we have available to us
+    datacenters_object_view = content.viewManager.CreateContainerView(
+        content.rootFolder,
+        [vim.Datacenter],
+        True)
+
+    # Find the datastore and datacenter we are using
+    datacenter = None
+    datastore = None
+    for dc in datacenters_object_view.view:
+        datastores_object_view = content.viewManager.CreateContainerView(
+            dc,
+            [vim.Datastore],
+            True)
+        for ds in datastores_object_view.view:
+            if ds.info.name == args.datastore:
+                datacenter = dc
+                datastore = ds
+    if not datacenter or not datastore:
+        print("Could not find the datastore specified")
+        raise SystemExit(-1)
+    # Clean up the views now that we have what we need
+    datastores_object_view.Destroy()
+    datacenters_object_view.Destroy()
+
+    # Build the url to put the file - https://hostname:port/resource?params
+    if not args.remote_file.startswith("/"):
+        remote_file = "/" + args.remote_file
+    else:
+        remote_file = args.remote_file
+    resource = "/folder" + remote_file
+    params = {"dsName": datastore.info.name,
+              "dcPath": datacenter.name}
+    http_url = "https://" + args.host + ":443" + resource
+
+    # Get the cookie built from the current session
+    client_cookie = service_instance._stub.cookie
+    # Break apart the cookie into it's component parts - This is more than
+    # is needed, but a good example of how to break apart the cookie
+    # anyways. The verbosity makes it clear what is happening.
+    cookie_name = client_cookie.split("=", 1)[0]
+    cookie_value = client_cookie.split("=", 1)[1].split(";", 1)[0]
+    cookie_path = client_cookie.split("=", 1)[1].split(";", 1)[1].split(
+        ";", 1)[0].lstrip()
+    cookie_text = " " + cookie_value + "; $" + cookie_path
+    # Make a cookie
+    cookie = dict()
+    cookie[cookie_name] = cookie_text
+
+    # Get the request headers set up
+    headers = {'Content-Type': 'application/octet-stream'}
+
+    # Get the file to upload ready, extra protection by using with against
+    # leaving open threads
+    with open(args.vmdk_path, "rb") as f:
+        # Connect and upload the file
+        request = requests.put(http_url,
+                               params=params,
+                               data=f,
+                               headers=headers,
+                               cookies=cookie,
+                               verify=args.disable_ssl_verification)
+
 def main():
     args = get_args()
     ovfd = get_ovf_descriptor(args.ovf_path)
     try:
+        if args.disable_ssl_verification:
+            context = ssl._create_unverified_context()
+            verify = False
+            requests.packages.urllib3.disable_warnings()
+        else:
+            context = None
+            verify = True
         si = connect.SmartConnect(host=args.host,
                                   user=args.user,
                                   pwd=args.password,
-                                  port=args.port)
-    except:
-        print "Unable to connect to %s" % args.host
+                                  port=args.port,
+                                  sslContext=context)
+    except Exception as e:
+        print "Unable to connect to '%s'. Exception: '%s'" % (args.host,str(e))
         exit(1)
     objs = get_objects(si, args)
     manager = si.content.ovfManager
@@ -189,22 +283,35 @@ def main():
                                            objs["resource pool"],
                                            objs["datastore"],
                                            spec_params)
-    lease = objs["resource pool"].ImportVApp(import_spec.importSpec)
+    lease = objs["resource pool"].ImportVApp(import_spec.importSpec, objs["datacenter"].vmFolder)
     while(True):
         if (lease.state == vim.HttpNfcLease.State.ready):
             # Assuming single VMDK.
+            print("Lease state ready...Attempting upload...")
             url = lease.info.deviceUrl[0].url.replace('*', args.host)
+            print(url)
             # Spawn a dawmon thread to keep the lease active while POSTing
             # VMDK.
             keepalive_thread = Thread(target=keep_lease_alive, args=(lease,))
             keepalive_thread.start()
             # POST the VMDK to the host via curl. Requests library would work
             # too.
+            '''
             curl_cmd = (
-                "curl -Ss -X POST --insecure -T %s -H 'Content-Type: \
-                application/x-vnd.vmware-streamVmdk' %s" %
+                "curl -Ss -X POST --insecure -T %s -H 'Content-Type: "
+                "application/x-vnd.vmware-streamVmdk' %s" %
                 (args.vmdk_path, url))
             system(curl_cmd)
+            '''
+            headers = {'Content-Type': 'application/x-vnd.vmware-streamVmdk'}
+            try:
+                with open(args.vmdk_path,'rb') as f:
+                    r = requests.put(url, data=f, headers=headers, verify=verify)
+                    print(r.status_code)
+                    print(r.content)
+            except Exception as ex:
+                print("Exception opening vmdk or uploading vmdk: %s" % str(ex))
+                exit(1)
             lease.HttpNfcLeaseComplete()
             keepalive_thread.join()
             return 0
